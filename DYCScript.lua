@@ -434,3 +434,14 @@ SetStatus("Script loaded ✅", Color3.fromRGB(60, 200, 120))
 task.delay(3, function()
     SetStatus("Idle")
 end)
+
+-- ============================================================
+task.wait(3)
+print("=== ALL REMOTES ===")
+for _, v in ipairs(game:GetService("ReplicatedStorage"):GetDescendants()) do
+    if v:IsA("RemoteEvent") or v:IsA("RemoteFunction") then
+        print(v.ClassName .. " >> " .. v:GetFullName())
+    end
+end
+print("=== END ===")
+-- ============================================================
