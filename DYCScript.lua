@@ -1,281 +1,257 @@
---[[
-    DEFEND YOUR CASTLE - Auto Script v2.0
-    GitHub: Minhtam-cr21/DefenseYourCastle
-
-    Confirmed remotes:
-    - UpdateCurrentShop -> returns {itemName = qty, ...}
-    - BuyDefense(itemName, qty) -> mua item
-    - StartChallenge() -> bắt đầu challenge (result=false = đang trong raid, cần EndChallenge trước)
-    - EndChallenge() -> kết thúc challenge hiện tại
-    - Remotes.ChallengeEnd -> event khi challenge xong
---]]
-
--- ============================================================
--- SERVICES
--- ============================================================
-local Players            = game:GetService("Players")
-local TweenService       = game:GetService("TweenService")
-local UserInputService   = game:GetService("UserInputService")
-local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local UIS = game:GetService("UserInputService")
+local RS = game:GetService("ReplicatedStorage")
+local VU = game:GetService("VirtualUser")
 
 local LP = Players.LocalPlayer
+local CoreGui = game:GetService("CoreGui")
+local UI_NAME = "DYC_UI"
+local CFG_PATH = "DYC_Config.json"
 
--- ============================================================
--- CLEANUP khi re-execute
--- ============================================================
-for _, loc in ipairs({game:GetService("CoreGui"), LP.PlayerGui}) do
-    local old = loc:FindFirstChild("DYC_UI")
-    if old then old:Destroy() end
+for _, parent in ipairs({CoreGui, LP:FindFirstChild("PlayerGui")}) do
+    if parent and parent:FindFirstChild(UI_NAME) then
+        parent[UI_NAME]:Destroy()
+    end
 end
 
--- ============================================================
--- REMOTES
--- ============================================================
-local Events    = ReplicatedStorage:WaitForChild("Events")
+local Events = RS:WaitForChild("Events")
 local Functions = Events:WaitForChild("Functions")
-local Remotes   = Events:WaitForChild("Remotes")
+local Remotes = Events:WaitForChild("Remotes")
 
-local RF_UpdateShop      = Functions:WaitForChild("UpdateCurrentShop")
-local RF_BuyDefense      = Functions:WaitForChild("BuyDefense")
-local RF_StartChallenge  = Functions:WaitForChild("StartChallenge")
-local RF_EndChallenge    = Functions:WaitForChild("EndChallenge")
-local RE_ChallengeEnd    = Remotes:FindFirstChild("ChallengeEnd")
+local RF_UpdateShop = Functions:FindFirstChild("UpdateCurrentShop")
+local RF_BuyDefense = Functions:FindFirstChild("BuyDefense")
+local RF_StartChallenge = Functions:FindFirstChild("StartChallenge")
+local RF_EndChallenge = Functions:FindFirstChild("EndChallenge")
+local RE_ChallengeEnd = Remotes:FindFirstChild("ChallengeEnd")
 
-print("[DYC] Remotes loaded OK")
+local CAN_FILE = type(readfile) == "function" and type(writefile) == "function" and type(isfile) == "function"
 
--- ============================================================
--- CONFIG (save/load bằng writefile/readfile)
--- ============================================================
-local CONFIG_PATH = "DYC_Config.json"
-
-local DEFAULT_CONFIG = {
-    AntiAFK           = false,
-    AutoBuy           = false,
-    AutoChallenge     = false,
-    ChallengeDifficulty = "Easy",  -- Easy | Medium | Pro
-    BuyDelay          = 3,         -- giây giữa mỗi lần mua
-    SelectedItems     = {},        -- {"Crossbow", "Cannon", ...} rỗng = mua tất cả
+local Config = {
+    AntiAFK = false,
+    AutoBuy = false,
+    AutoChallenge = false,
+    BuyDelay = 3,
+    ChallengeDelay = 10,
+    ChallengeDifficulty = "Easy",
+    BuyAllItems = false,
+    SelectedItems = {},
 }
 
-local function SaveConfig(cfg)
-    pcall(function()
-        local ok, enc = pcall(function()
-            -- encode JSON thủ công (không có thư viện)
-            local parts = {}
-            for k, v in pairs(cfg) do
-                local val
-                if type(v) == "boolean" then
-                    val = v and "true" or "false"
-                elseif type(v) == "number" then
-                    val = tostring(v)
-                elseif type(v) == "string" then
-                    val = '"' .. v .. '"'
-                elseif type(v) == "table" then
-                    local arr = {}
-                    for _, item in ipairs(v) do
-                        table.insert(arr, '"' .. tostring(item) .. '"')
-                    end
-                    val = "[" .. table.concat(arr, ",") .. "]"
-                end
-                if val then
-                    table.insert(parts, '"' .. k .. '":' .. val)
-                end
-            end
-            return "{" .. table.concat(parts, ",") .. "}"
-        end)
-        if ok then writefile(CONFIG_PATH, enc) end
-    end)
+local State = {
+    Bought = 0,
+    Challenges = 0,
+    LastStatus = "Ready",
+    LastError = "None",
+    LastSave = "Not saved yet",
+    LastBuy = "None",
+    LastChallenge = "Idle",
+    ChallengeActive = false,
+    ShopItems = {},
+    Logs = {},
+}
+
+local function log(text)
+    local line = "[DYC] " .. tostring(text)
+    print(line)
+    table.insert(State.Logs, 1, line)
+    while #State.Logs > 14 do
+        table.remove(State.Logs)
+    end
 end
 
-local function LoadConfig()
-    local cfg = {}
-    -- copy defaults
-    for k, v in pairs(DEFAULT_CONFIG) do
-        if type(v) == "table" then
-            cfg[k] = {}
-            for _, item in ipairs(v) do table.insert(cfg[k], item) end
-        else
-            cfg[k] = v
+local function saveConfig()
+    if not CAN_FILE then
+        State.LastSave = "Executor has no file API"
+        return
+    end
+    local parts = {}
+    for k, v in pairs(Config) do
+        if type(v) == "boolean" then
+            table.insert(parts, '"' .. k .. '":' .. (v and "true" or "false"))
+        elseif type(v) == "number" then
+            table.insert(parts, '"' .. k .. '":' .. tostring(v))
+        elseif type(v) == "string" then
+            table.insert(parts, '"' .. k .. '":"' .. v .. '"')
+        elseif type(v) == "table" then
+            local arr = {}
+            for _, item in ipairs(v) do
+                table.insert(arr, '"' .. tostring(item) .. '"')
+            end
+            table.insert(parts, '"' .. k .. '":[' .. table.concat(arr, ",") .. ']')
         end
     end
+    local ok, err = pcall(function()
+        writefile(CFG_PATH, "{" .. table.concat(parts, ",") .. "}")
+    end)
+    State.LastSave = ok and ("Saved " .. CFG_PATH) or ("Save failed: " .. tostring(err))
+end
 
-    pcall(function()
-        if not isfile(CONFIG_PATH) then return end
-        local raw = readfile(CONFIG_PATH)
-        if not raw or raw == "" then return end
-
-        -- parse JSON thủ công
-        -- booleans
-        for k in pairs(DEFAULT_CONFIG) do
-            if type(DEFAULT_CONFIG[k]) == "boolean" then
-                local val = raw:match('"' .. k .. '"%s*:%s*(true|false)')
-                if val then cfg[k] = (val == "true") end
-            elseif type(DEFAULT_CONFIG[k]) == "number" then
-                local val = raw:match('"' .. k .. '"%s*:%s*([%d%.]+)')
-                if val then cfg[k] = tonumber(val) end
-            elseif type(DEFAULT_CONFIG[k]) == "string" then
-                local val = raw:match('"' .. k .. '"%s*:%s*"([^"]*)"')
-                if val then cfg[k] = val end
-            elseif type(DEFAULT_CONFIG[k]) == "table" then
-                local arr = raw:match('"' .. k .. '"%s*:%s*%[([^%]]*)%]')
-                if arr then
-                    cfg[k] = {}
-                    for item in arr:gmatch('"([^"]*)"') do
-                        table.insert(cfg[k], item)
-                    end
+local function loadConfig()
+    if not CAN_FILE or not isfile(CFG_PATH) then
+        State.LastSave = CAN_FILE and "No config file yet" or "Executor has no file API"
+        return
+    end
+    local ok, raw = pcall(readfile, CFG_PATH)
+    if not ok or type(raw) ~= "string" then
+        State.LastSave = "Load failed"
+        return
+    end
+    for key, default in pairs(Config) do
+        if type(default) == "boolean" then
+            local v = raw:match('"' .. key .. '"%s*:%s*(true|false)')
+            if v then Config[key] = v == "true" end
+        elseif type(default) == "number" then
+            local v = raw:match('"' .. key .. '"%s*:%s*([%d%.]+)')
+            if v then Config[key] = tonumber(v) end
+        elseif type(default) == "string" then
+            local v = raw:match('"' .. key .. '"%s*:%s*"([^"]*)"')
+            if v then Config[key] = v end
+        elseif type(default) == "table" then
+            local arr = raw:match('"' .. key .. '"%s*:%s*%[([^%]]*)%]')
+            Config[key] = {}
+            if arr then
+                for item in arr:gmatch('"([^"]*)"') do
+                    table.insert(Config[key], item)
                 end
             end
         end
-    end)
-
-    return cfg
+    end
+    State.LastSave = "Loaded " .. CFG_PATH
 end
 
--- Load config ngay khi khởi động
-local Config = LoadConfig()
+loadConfig()
 
--- ============================================================
--- STATE
--- ============================================================
-local Stats = { Bought = 0, Challenges = 0 }
-local challengeActive = false
-local allShopItems = {}  -- được cập nhật từ UpdateCurrentShop
-
--- ============================================================
--- REMOTE: LẤY DANH SÁCH SHOP
--- ============================================================
-local function FetchShop()
-    local ok, result = pcall(function()
-        return RF_UpdateShop:InvokeServer()
-    end)
-    if ok and type(result) == "table" then
-        allShopItems = result
-        return result
+local function isSelected(name)
+    if Config.BuyAllItems then
+        return true
     end
-    return {}
-end
-
--- ============================================================
--- CORE: AUTO BUY
--- ============================================================
--- BuyDefense nhận: (defenseName: string, quantity: number)
--- UpdateCurrentShop trả về {defenseName = qty}
--- Chỉ mua những item có qty > 0 VÀ nằm trong SelectedItems (nếu có chọn)
-
-local function IsItemSelected(name)
-    if #Config.SelectedItems == 0 then
-        return true -- không filter = mua tất
-    end
-    for _, sel in ipairs(Config.SelectedItems) do
-        if sel == name then return true end
+    for _, item in ipairs(Config.SelectedItems) do
+        if item == name then
+            return true
+        end
     end
     return false
 end
 
-local function DoBuyAll()
-    local shop = FetchShop()
-    local bought = 0
+local function toggleItem(name)
+    for i, item in ipairs(Config.SelectedItems) do
+        if item == name then
+            table.remove(Config.SelectedItems, i)
+            saveConfig()
+            return
+        end
+    end
+    table.insert(Config.SelectedItems, name)
+    saveConfig()
+end
 
-    for itemName, qty in pairs(shop) do
-        if type(qty) == "number" and qty > 0 and IsItemSelected(itemName) then
+local function sortedShop()
+    local items = {}
+    for name, qty in pairs(State.ShopItems) do
+        table.insert(items, {name = tostring(name), qty = tonumber(qty) or 0})
+    end
+    table.sort(items, function(a, b) return a.name < b.name end)
+    return items
+end
+
+local function fetchShop()
+    if not RF_UpdateShop then
+        State.LastError = "UpdateCurrentShop missing"
+        return
+    end
+    local ok, result = pcall(function()
+        return RF_UpdateShop:InvokeServer()
+    end)
+    if ok and type(result) == "table" then
+        State.ShopItems = result
+    else
+        State.LastError = "Shop fetch failed: " .. tostring(result)
+        log(State.LastError)
+    end
+end
+
+local function autoBuyOnce()
+    if not RF_BuyDefense then
+        State.LastError = "BuyDefense missing"
+        return
+    end
+    fetchShop()
+    local boughtAny = false
+    for _, entry in ipairs(sortedShop()) do
+        if entry.qty > 0 and isSelected(entry.name) then
             local ok, result = pcall(function()
-                return RF_BuyDefense:InvokeServer(itemName, qty)
+                return RF_BuyDefense:InvokeServer(entry.name, entry.qty)
             end)
             if ok then
-                bought = bought + qty
-                Stats.Bought = Stats.Bought + qty
-                print("[DYC] Bought: " .. itemName .. " x" .. qty)
+                boughtAny = true
+                State.Bought = State.Bought + entry.qty
+                State.LastBuy = entry.name .. " x" .. entry.qty
+                log("Bought " .. State.LastBuy)
             else
-                print("[DYC] BuyDefense error: " .. tostring(result))
+                State.LastError = "Buy failed for " .. entry.name .. ": " .. tostring(result)
+                log(State.LastError)
             end
             task.wait(0.2)
         end
     end
-
-    return bought
-end
-
-task.spawn(function()
-    while true do
-        task.wait(Config.BuyDelay)
-        if Config.AutoBuy then
-            local n = DoBuyAll()
-            if n > 0 then
-                print("[DYC] AutoBuy cycle: bought " .. n .. " items")
-            end
-        end
+    if not boughtAny then
+        State.LastBuy = "No matching stock"
     end
-end)
-
--- ============================================================
--- CORE: AUTO CHALLENGE
--- ============================================================
--- StartChallenge result=false khi đang trong raid → cần EndChallenge trước
--- Difficulty: game không nhận string → thử fire không tham số
-
-if RE_ChallengeEnd then
-    RE_ChallengeEnd.OnClientEvent:Connect(function()
-        challengeActive = false
-        print("[DYC] ChallengeEnd event received")
-    end)
 end
 
-local function TryStartChallenge()
-    if challengeActive then return end
+local DIFF_ARGS = {
+    Easy = {"Easy", "easy", 1, "1"},
+    Medium = {"Medium", "medium", 2, "2"},
+    Pro = {"Pro", "pro", 3, "3"},
+}
 
-    -- Bước 1: End challenge hiện tại (nếu có) để clear state
-    pcall(function() RF_EndChallenge:InvokeServer() end)
-    task.wait(1)
-
-    -- Bước 2: Start challenge
-    -- Difficulty map (từ scan: tất cả string đều return false → thử không args)
-    local diffMap = {
-        Easy   = 1,
-        Medium = 2,
-        Pro    = 3,
-    }
-    local diffNum = diffMap[Config.ChallengeDifficulty] or 1
-
-    -- Thử với số
-    local ok1, r1 = pcall(function()
-        return RF_StartChallenge:InvokeServer(diffNum)
-    end)
-    print("[DYC] StartChallenge(" .. diffNum .. ") -> " .. tostring(ok1) .. " / " .. tostring(r1))
-
-    -- Nếu số không work, thử không args
-    if not ok1 or r1 == false then
-        local ok2, r2 = pcall(function()
+local function autoChallengeOnce()
+    if not RF_StartChallenge then
+        State.LastError = "StartChallenge missing"
+        return
+    end
+    if RF_EndChallenge then
+        pcall(function() RF_EndChallenge:InvokeServer() end)
+        task.wait(0.7)
+    end
+    local success = false
+    local tries = DIFF_ARGS[Config.ChallengeDifficulty] or DIFF_ARGS.Easy
+    for _, arg in ipairs(tries) do
+        local ok, result = pcall(function()
+            return RF_StartChallenge:InvokeServer(arg)
+        end)
+        log("StartChallenge(" .. tostring(arg) .. ") => " .. tostring(ok) .. " / " .. tostring(result))
+        if ok and result ~= false then
+            success = true
+            break
+        end
+        task.wait(0.25)
+    end
+    if not success then
+        local ok, result = pcall(function()
             return RF_StartChallenge:InvokeServer()
         end)
-        print("[DYC] StartChallenge() -> " .. tostring(ok2) .. " / " .. tostring(r2))
-        if ok2 and r2 ~= false then
-            challengeActive = true
-        end
-    else
-        if r1 ~= false then
-            challengeActive = true
-        end
+        log("StartChallenge() => " .. tostring(ok) .. " / " .. tostring(result))
+        success = ok and result ~= false
     end
-
-    if challengeActive then
-        Stats.Challenges = Stats.Challenges + 1
-        print("[DYC] Challenge started! Total: " .. Stats.Challenges)
-        task.delay(300, function() challengeActive = false end)
+    State.ChallengeActive = success
+    State.LastChallenge = success and ("Started " .. Config.ChallengeDifficulty) or "Start failed"
+    if success then
+        State.Challenges = State.Challenges + 1
+    else
+        State.LastError = "Challenge start failed"
     end
 end
 
-task.spawn(function()
-    while true do
-        task.wait(8)
-        if Config.AutoChallenge then
-            TryStartChallenge()
-        end
-    end
-end)
+if RE_ChallengeEnd then
+    RE_ChallengeEnd.OnClientEvent:Connect(function(...)
+        State.ChallengeActive = false
+        State.LastChallenge = "Challenge ended"
+        log("ChallengeEnd => " .. tostring(select(1, ...)))
+    end)
+end
 
--- ============================================================
--- CORE: ANTI-AFK
--- ============================================================
 task.spawn(function()
     while true do
         task.wait(50)
@@ -286,525 +262,292 @@ task.spawn(function()
                 if hum and hum.Health > 0 then hum.Jump = true end
             end
             pcall(function()
-                local VU = game:GetService("VirtualUser")
-                VU:Button1Down(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+                VU:Button1Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
                 task.wait(0.1)
-                VU:Button1Up(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+                VU:Button1Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
             end)
-            print("[DYC] Anti-AFK fired")
+            State.LastStatus = "Anti-AFK pulse"
         end
     end
 end)
 
--- ============================================================
--- UI THEME
--- ============================================================
-local CLR = {
-    BG      = Color3.fromRGB(14, 14, 22),
-    PANEL   = Color3.fromRGB(22, 22, 34),
-    HDR     = Color3.fromRGB(24, 24, 42),
-    ACCENT  = Color3.fromRGB(72, 110, 255),
-    GREEN   = Color3.fromRGB(50, 190, 105),
-    RED     = Color3.fromRGB(200, 52, 52),
-    YELLOW  = Color3.fromRGB(240, 185, 40),
-    TEXT    = Color3.fromRGB(222, 222, 242),
-    SUB     = Color3.fromRGB(108, 108, 140),
-    BORDER  = Color3.fromRGB(40, 40, 68),
-    TOGOFF  = Color3.fromRGB(46, 46, 68),
-    ITEMSEL = Color3.fromRGB(35, 70, 35),
-    ITEMDEF = Color3.fromRGB(26, 26, 40),
+task.spawn(function()
+    while true do
+        task.wait(Config.BuyDelay)
+        if Config.AutoBuy then autoBuyOnce() end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(Config.ChallengeDelay)
+        if Config.AutoChallenge then autoChallengeOnce() end
+    end
+end)
+
+local C = {
+    bg = Color3.fromRGB(16, 18, 26),
+    panel = Color3.fromRGB(25, 28, 40),
+    head = Color3.fromRGB(35, 39, 56),
+    soft = Color3.fromRGB(45, 50, 70),
+    accent = Color3.fromRGB(78, 132, 255),
+    green = Color3.fromRGB(64, 189, 115),
+    red = Color3.fromRGB(214, 78, 78),
+    gold = Color3.fromRGB(225, 180, 62),
+    text = Color3.fromRGB(235, 239, 248),
+    sub = Color3.fromRGB(145, 150, 170),
+    stroke = Color3.fromRGB(50, 55, 76),
+    active = Color3.fromRGB(42, 83, 55),
 }
 
-local function Rnd(i, r) local c = Instance.new("UICorner") c.CornerRadius=UDim.new(0,r or 8) c.Parent=i end
-local function Strk(i,c,t) local s=Instance.new("UIStroke") s.Color=c or CLR.BORDER s.Thickness=t or 1 s.Parent=i end
-
-local function Frm(p,sz,pos,col)
-    local f=Instance.new("Frame") f.Size=sz f.Position=pos or UDim2.new(0,0,0,0)
-    f.BackgroundColor3=col or CLR.PANEL f.BorderSizePixel=0 f.Parent=p return f
+local function corner(i, r) local c = Instance.new("UICorner") c.CornerRadius = UDim.new(0, r or 8) c.Parent = i end
+local function border(i) local s = Instance.new("UIStroke") s.Color = C.stroke s.Parent = i end
+local function frame(p, size, pos, col) local f = Instance.new("Frame") f.Size = size f.Position = pos or UDim2.new() f.BackgroundColor3 = col or C.panel f.BorderSizePixel = 0 f.Parent = p return f end
+local function label(p, txt, size, pos, col, ts, font)
+    local l = Instance.new("TextLabel") l.Size = size l.Position = pos or UDim2.new() l.BackgroundTransparency = 1 l.Text = txt l.TextColor3 = col or C.text l.TextSize = ts or 12 l.Font = font or Enum.Font.GothamMedium l.TextWrapped = true l.TextXAlignment = Enum.TextXAlignment.Left l.Parent = p return l
+end
+local function button(p, txt, size, pos, col, fn)
+    local b = Instance.new("TextButton") b.Size = size b.Position = pos or UDim2.new() b.BackgroundColor3 = col or C.accent b.BorderSizePixel = 0 b.Text = txt b.TextColor3 = C.text b.TextSize = 12 b.Font = Enum.Font.GothamBold b.Parent = p corner(b, 7) if fn then b.MouseButton1Click:Connect(fn) end return b
 end
 
-local function Lbl(p,txt,sz,pos,col,fs,fn,xa)
-    local l=Instance.new("TextLabel") l.Text=txt l.Size=sz l.Position=pos or UDim2.new(0,0,0,0)
-    l.BackgroundTransparency=1 l.TextColor3=col or CLR.TEXT l.TextSize=fs or 13
-    l.Font=fn or Enum.Font.GothamMedium l.TextXAlignment=xa or Enum.TextXAlignment.Left
-    l.TextWrapped=true l.Parent=p return l
-end
-
-local function Btn(p,txt,sz,pos,col,cb)
-    local b=Instance.new("TextButton") b.Text=txt b.Size=sz b.Position=pos or UDim2.new(0,0,0,0)
-    b.BackgroundColor3=col or CLR.ACCENT b.TextColor3=CLR.TEXT b.TextSize=12
-    b.Font=Enum.Font.GothamBold b.BorderSizePixel=0 b.AutoButtonColor=false b.Parent=p
-    Rnd(b,7)
-    b.MouseEnter:Connect(function()
-        TweenService:Create(b,TweenInfo.new(0.15),{BackgroundColor3=Color3.new(
-            math.min((col or CLR.ACCENT).R+0.08,1),
-            math.min((col or CLR.ACCENT).G+0.08,1),
-            math.min((col or CLR.ACCENT).B+0.08,1)
-        )}):Play()
-    end)
-    b.MouseLeave:Connect(function()
-        TweenService:Create(b,TweenInfo.new(0.15),{BackgroundColor3=col or CLR.ACCENT}):Play()
-    end)
-    if cb then b.MouseButton1Click:Connect(cb) end
-    return b
-end
-
--- ============================================================
--- SCREENGUI
--- ============================================================
 local SG = Instance.new("ScreenGui")
-SG.Name = "DYC_UI"
+SG.Name = UI_NAME
 SG.ResetOnSpawn = false
 SG.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 SG.DisplayOrder = 100
-local ok = pcall(function() SG.Parent = game:GetService("CoreGui") end)
-if not ok or not SG.Parent then SG.Parent = LP.PlayerGui end
-print("[DYC] ScreenGui in: " .. SG.Parent.Name)
+local ok = pcall(function() SG.Parent = CoreGui end)
+if not ok or not SG.Parent then SG.Parent = LP:WaitForChild("PlayerGui") end
 
--- ============================================================
--- MAIN WINDOW
--- ============================================================
-local Win = Frm(SG, UDim2.new(0,320,0,0), UDim2.new(0.04,0,0.08,0), CLR.BG)
+local Win = frame(SG, UDim2.new(0, 360, 0, 0), UDim2.new(0.04, 0, 0.08, 0), C.bg)
 Win.AutomaticSize = Enum.AutomaticSize.Y
-Rnd(Win, 12)
-Strk(Win, CLR.BORDER, 1)
+corner(Win, 12)
+border(Win)
 
--- HEADER
-local Hdr = Frm(Win, UDim2.new(1,0,0,48), UDim2.new(0,0,0,0), CLR.HDR)
-Rnd(Hdr, 12)
-Frm(Hdr, UDim2.new(1,0,0,12), UDim2.new(0,0,1,-12), CLR.HDR)
+local Head = frame(Win, UDim2.new(1, 0, 0, 50), nil, C.head)
+corner(Head, 12)
+frame(Head, UDim2.new(1, 0, 0, 12), UDim2.new(0, 0, 1, -12), C.head)
+label(Head, "Defend Your Castle", UDim2.new(1, -100, 0, 22), UDim2.new(0, 14, 0, 6), C.text, 14, Enum.Font.GothamBold)
+label(Head, "v3.0 | RightShift toggle", UDim2.new(1, -100, 0, 14), UDim2.new(0, 14, 0, 30), C.sub, 10, Enum.Font.Gotham)
+button(Head, "X", UDim2.new(0, 26, 0, 26), UDim2.new(1, -34, 0.5, -13), C.red, function() Win.Visible = false end)
 
-Lbl(Hdr,"🏰  Defend Your Castle",UDim2.new(1,-96,0,26),UDim2.new(0,14,0,5),CLR.TEXT,14,Enum.Font.GothamBold)
-Lbl(Hdr,"v2.0  •  RightShift = ẩn/hiện",UDim2.new(1,-96,0,14),UDim2.new(0,14,0,30),CLR.SUB,10,Enum.Font.Gotham)
-
-local function HdrBtn(txt, xOff, col, cb)
-    local b = Btn(Hdr, txt, UDim2.new(0,26,0,26), UDim2.new(1,xOff,0.5,-13), col, cb)
-    return b
-end
-HdrBtn("✕", -32, CLR.RED, function() Win.Visible = false end)
-local minBtn = HdrBtn("−", -62, CLR.TOGOFF, nil)
-
--- BODY
-local Body = Frm(Win, UDim2.new(1,-20,0,0), UDim2.new(0,10,0,56), Color3.new(0,0,0))
+local Body = frame(Win, UDim2.new(1, -20, 0, 0), UDim2.new(0, 10, 0, 58), Color3.new())
 Body.BackgroundTransparency = 1
 Body.AutomaticSize = Enum.AutomaticSize.Y
+local BL = Instance.new("UIListLayout") BL.Padding = UDim.new(0, 6) BL.Parent = Body
 
-local bodyLayout = Instance.new("UIListLayout")
-bodyLayout.SortOrder = Enum.SortOrder.LayoutOrder
-bodyLayout.Padding = UDim.new(0,6)
-bodyLayout.Parent = Body
+local TabBar = frame(Body, UDim2.new(1, 0, 0, 30), nil, C.panel)
+corner(TabBar, 8)
+local TL = Instance.new("UIListLayout") TL.FillDirection = Enum.FillDirection.Horizontal TL.Padding = UDim.new(0, 4) TL.Parent = TabBar
 
-local bodyPad = Instance.new("UIPadding")
-bodyPad.PaddingBottom = UDim.new(0,12)
-bodyPad.Parent = Body
-
-local bodyVisible = true
-minBtn.MouseButton1Click:Connect(function()
-    bodyVisible = not bodyVisible
-    Body.Visible = bodyVisible
-end)
-
--- ============================================================
--- TAB SYSTEM
--- ============================================================
-local tabOrder = 0
-local tabs = {}
-local pages = {}
-local activeTab = nil
-
--- Tab bar
-local TabBar = Frm(Body, UDim2.new(1,0,0,30), nil, CLR.PANEL)
-TabBar.LayoutOrder = 0
-Rnd(TabBar, 8)
-
-local tbLayout = Instance.new("UIListLayout")
-tbLayout.FillDirection = Enum.FillDirection.Horizontal
-tbLayout.SortOrder = Enum.SortOrder.LayoutOrder
-tbLayout.Padding = UDim.new(0,3)
-tbLayout.VerticalAlignment = Enum.VerticalAlignment.Center
-tbLayout.Parent = TabBar
-
-local tbPad = Instance.new("UIPadding")
-tbPad.PaddingLeft = UDim.new(0,4)
-tbPad.Parent = TabBar
-
-local function SetActiveTab(name)
-    for tname, page in pairs(pages) do
-        page.Visible = (tname == name)
-    end
-    for tname, tbtn in pairs(tabs) do
-        TweenService:Create(tbtn, TweenInfo.new(0.15), {
-            BackgroundColor3 = tname == name and CLR.ACCENT or CLR.TOGOFF,
-            TextColor3 = tname == name and CLR.TEXT or CLR.SUB,
-        }):Play()
-    end
-    activeTab = name
+local pages, tabs = {}, {}
+local function activate(name)
+    for n, p in pairs(pages) do p.Visible = n == name end
+    for n, b in pairs(tabs) do b.BackgroundColor3 = (n == name) and C.accent or C.soft b.TextColor3 = (n == name) and C.text or C.sub end
 end
 
-local pageOrder = 1
-local function MakeTab(name, icon)
-    tabOrder = tabOrder + 1
-    local tbtn = Instance.new("TextButton")
-    tbtn.Text = (icon and icon.." " or "") .. name
-    tbtn.Size = UDim2.new(0,88,1,-6)
-    tbtn.BackgroundColor3 = CLR.TOGOFF
-    tbtn.TextColor3 = CLR.SUB
-    tbtn.TextSize = 12
-    tbtn.Font = Enum.Font.GothamMedium
-    tbtn.BorderSizePixel = 0
-    tbtn.LayoutOrder = tabOrder
-    tbtn.Parent = TabBar
-    Rnd(tbtn, 6)
-
-    pageOrder = pageOrder + 1
-    local page = Frm(Body, UDim2.new(1,0,0,0), nil, Color3.new(0,0,0))
-    page.BackgroundTransparency = 1
-    page.AutomaticSize = Enum.AutomaticSize.Y
-    page.LayoutOrder = pageOrder
-    page.Visible = false
-
-    local pl = Instance.new("UIListLayout")
-    pl.SortOrder = Enum.SortOrder.LayoutOrder
-    pl.Padding = UDim.new(0,6)
-    pl.Parent = page
-
-    tabs[name] = tbtn
-    pages[name] = page
-    tbtn.MouseButton1Click:Connect(function() SetActiveTab(name) end)
-    return page
+local function makePage(name)
+    local tb = Instance.new("TextButton")
+    tb.Size = UDim2.new(0, 84, 1, -6)
+    tb.BackgroundColor3 = C.soft
+    tb.TextColor3 = C.sub
+    tb.BorderSizePixel = 0
+    tb.Text = name
+    tb.TextSize = 12
+    tb.Font = Enum.Font.GothamMedium
+    tb.Parent = TabBar
+    corner(tb, 6)
+    local p = frame(Body, UDim2.new(1, 0, 0, 0), nil, Color3.new())
+    p.BackgroundTransparency = 1
+    p.AutomaticSize = Enum.AutomaticSize.Y
+    local pl = Instance.new("UIListLayout") pl.Padding = UDim.new(0, 6) pl.Parent = p
+    pages[name] = p
+    tabs[name] = tb
+    tb.MouseButton1Click:Connect(function() activate(name) end)
+    return p
 end
 
--- ============================================================
--- WIDGET HELPERS
--- ============================================================
-local function Section(page, txt, order)
-    local l = Lbl(page, txt:upper(), UDim2.new(1,0,0,16), nil, CLR.SUB, 10, Enum.Font.GothamBold)
-    l.LayoutOrder = order
-end
+local Main = makePage("Main")
+local Buy = makePage("Buy")
+local Chall = makePage("Challenge")
+local Debug = makePage("Debug")
+activate("Main")
 
-local StatusLbl
-local function SetStatus(msg, col)
-    if StatusLbl then
-        StatusLbl.Text = "● " .. msg
-        StatusLbl.TextColor3 = col or CLR.SUB
-    end
-end
+local function section(p, t) label(p, string.upper(t), UDim2.new(1, 0, 0, 16), nil, C.sub, 10, Enum.Font.GothamBold) end
+local StatusLabel
 
--- Toggle row
-local function MakeToggle(page, order, title, desc, flag, onToggle)
-    local row = Frm(page, UDim2.new(1,0,0,66), nil, CLR.PANEL)
-    row.LayoutOrder = order
-    Rnd(row, 9) Strk(row, CLR.BORDER, 1)
-    Lbl(row, title, UDim2.new(1,-68,0,22), UDim2.new(0,12,0,10), CLR.TEXT, 13, Enum.Font.GothamBold)
-    Lbl(row, desc,  UDim2.new(1,-68,0,18), UDim2.new(0,12,0,34), CLR.SUB, 11, Enum.Font.Gotham)
-
-    local pill = Instance.new("TextButton")
-    pill.Text="" pill.Size=UDim2.new(0,44,0,22) pill.Position=UDim2.new(1,-54,0.5,-11)
-    pill.BackgroundColor3 = Config[flag] and CLR.GREEN or CLR.TOGOFF
-    pill.BorderSizePixel=0 pill.Parent=row
-    Rnd(pill,11)
-
-    local knob = Frm(pill, UDim2.new(0,16,0,16),
-        Config[flag] and UDim2.new(0,25,0.5,-8) or UDim2.new(0,3,0.5,-8),
-        Color3.fromRGB(200,200,220))
-    Rnd(knob,8)
-
-    local function Refresh(on)
-        TweenService:Create(pill,TweenInfo.new(0.18,Enum.EasingStyle.Quad),{BackgroundColor3=on and CLR.GREEN or CLR.TOGOFF}):Play()
-        TweenService:Create(knob,TweenInfo.new(0.18,Enum.EasingStyle.Quad),{Position=on and UDim2.new(0,25,0.5,-8) or UDim2.new(0,3,0.5,-8)}):Play()
-    end
-
+local function toggleRow(p, title, desc, key)
+    local r = frame(p, UDim2.new(1, 0, 0, 66), nil, C.panel) corner(r, 9) border(r)
+    label(r, title, UDim2.new(1, -74, 0, 22), UDim2.new(0, 12, 0, 10), C.text, 13, Enum.Font.GothamBold)
+    label(r, desc, UDim2.new(1, -74, 0, 18), UDim2.new(0, 12, 0, 34), C.sub, 11, Enum.Font.Gotham)
+    local pill = Instance.new("TextButton") pill.Size = UDim2.new(0, 44, 0, 22) pill.Position = UDim2.new(1, -56, 0.5, -11) pill.BorderSizePixel = 0 pill.Text = "" pill.BackgroundColor3 = Config[key] and C.green or C.soft pill.Parent = r corner(pill, 11)
+    local knob = frame(pill, UDim2.new(0, 16, 0, 16), Config[key] and UDim2.new(0, 25, 0.5, -8) or UDim2.new(0, 3, 0.5, -8), Color3.fromRGB(236, 238, 245)) corner(knob, 8)
     pill.MouseButton1Click:Connect(function()
-        Config[flag] = not Config[flag]
-        Refresh(Config[flag])
-        SaveConfig(Config)
-        if onToggle then onToggle(Config[flag]) end
-    end)
-
-    return row
-end
-
--- ============================================================
--- PAGE: MAIN
--- ============================================================
-local pageMain = MakeTab("Main", "⚡")
-SetActiveTab("Main")
-
-Section(pageMain, "Auto Features", 1)
-
-MakeToggle(pageMain, 2, "Anti-AFK", "Tự động hành động mỗi 50s để không bị kick", "AntiAFK",
-    function(on) SetStatus(on and "Anti-AFK đang chạy" or "Anti-AFK tắt", on and CLR.GREEN or CLR.RED) end)
-
-MakeToggle(pageMain, 3, "Auto Buy Prints", "Mua Blueprint có stock → xem tab 'Buy' để chọn item", "AutoBuy",
-    function(on) SetStatus(on and "Auto Buy đang chạy..." or "Auto Buy tắt", on and CLR.GREEN or CLR.RED) end)
-
-MakeToggle(pageMain, 4, "Auto Challenges", "Tự động bắt đầu Challenge → xem tab 'Chall'", "AutoChallenge",
-    function(on) SetStatus(on and "Auto Challenge đang chạy..." or "Auto Challenge tắt", on and CLR.GREEN or CLR.RED) end)
-
-Section(pageMain, "Stats", 5)
-local statsRow = Frm(pageMain, UDim2.new(1,0,0,36), nil, CLR.PANEL)
-statsRow.LayoutOrder = 6
-Rnd(statsRow,9) Strk(statsRow,CLR.BORDER,1)
-local bLbl = Lbl(statsRow,"📄 Prints: 0",UDim2.new(0.5,0,1,0),UDim2.new(0,12,0,0),CLR.GREEN,12)
-local cLbl = Lbl(statsRow,"⚡ Challenges: 0",UDim2.new(0.5,0,1,0),UDim2.new(0.5,0,0,0),CLR.GREEN,12)
-task.spawn(function()
-    while true do task.wait(2) pcall(function()
-        bLbl.Text="📄 Prints: "..Stats.Bought
-        cLbl.Text="⚡ Challenges: "..Stats.Challenges
-    end) end
-end)
-
-Section(pageMain, "Status", 7)
-local statusBar = Frm(pageMain, UDim2.new(1,0,0,28), nil, Color3.fromRGB(16,16,26))
-statusBar.LayoutOrder = 8
-Rnd(statusBar,8)
-StatusLbl = Lbl(statusBar,"● Ready",UDim2.new(1,-12,1,0),UDim2.new(0,10,0,0),CLR.SUB,11,Enum.Font.GothamMedium)
-
--- ============================================================
--- PAGE: BUY (chọn item)
--- ============================================================
-local pageBuy = MakeTab("Buy", "🛒")
-
--- Danh sách item đầy đủ từ scan
-local ALL_ITEMS = {
-    "Crossbow","The Shocker","Archer Tower","Flamethrower","Mortar",
-    "Mystic Artillery","Cannon","Double Cannon","Mega Tesla","Wizard Tower",
-    "Wall","Inferno Beam","Mega Cannon","Railgun","Tesla","Mega Mortar",
-    "Double Magma Cannon","Bomb Tower","Magma Cannon","Mega Crossbow",
-    "Minigun","Flamespitter","Triple Mortar","Rocket Artillery",
-    "Hidden Tesla","Catapult","The Crusher","Volcanic Artillery",
-}
-
-local itemOrder = 0
-local function BuySection(txt, ord)
-    local l = Lbl(pageBuy, txt:upper(), UDim2.new(1,0,0,16), nil, CLR.SUB, 10, Enum.Font.GothamBold)
-    l.LayoutOrder = ord
-end
-
-itemOrder = itemOrder + 1
-BuySection("Chọn item để Auto Buy (rỗng = mua tất)", itemOrder)
-
-itemOrder = itemOrder + 1
-local selectHint = Lbl(pageBuy,
-    "Bật toggle = chọn mua item đó | Tắt = bỏ qua\nRỗng tất cả = mua mọi item có stock",
-    UDim2.new(1,0,0,32), nil, CLR.SUB, 11, Enum.Font.Gotham)
-selectHint.LayoutOrder = itemOrder
-
--- Nút Select All / Clear All
-itemOrder = itemOrder + 1
-local btnRow = Frm(pageBuy, UDim2.new(1,0,0,30), nil, Color3.new(0,0,0))
-btnRow.BackgroundTransparency = 1
-btnRow.LayoutOrder = itemOrder
-local btnLayout = Instance.new("UIListLayout")
-btnLayout.FillDirection = Enum.FillDirection.Horizontal
-btnLayout.Padding = UDim.new(0,6)
-btnLayout.Parent = btnRow
-
-local itemToggleBtns = {} -- name -> {btn, selected}
-
-local function RefreshItemUI()
-    for name, data in pairs(itemToggleBtns) do
-        local isSelected = IsItemSelected(name)
-        data.selected = isSelected
-        TweenService:Create(data.btn, TweenInfo.new(0.15), {
-            BackgroundColor3 = isSelected and CLR.ITEMSEL or CLR.ITEMDEF,
-            TextColor3 = isSelected and CLR.GREEN or CLR.SUB,
-        }):Play()
-    end
-end
-
-Btn(btnRow, "✅ Chọn tất", UDim2.new(0.5,-3,1,0), nil, CLR.ITEMSEL, function()
-    Config.SelectedItems = {}
-    for _, name in ipairs(ALL_ITEMS) do
-        table.insert(Config.SelectedItems, name)
-    end
-    SaveConfig(Config)
-    RefreshItemUI()
-end)
-
-Btn(btnRow, "❌ Bỏ tất", UDim2.new(0.5,-3,1,0), UDim2.new(0.5,3,0,0), CLR.ITEMDEF, function()
-    Config.SelectedItems = {}
-    SaveConfig(Config)
-    RefreshItemUI()
-end)
-
--- Grid items
-itemOrder = itemOrder + 1
-local grid = Frm(pageBuy, UDim2.new(1,0,0,0), nil, Color3.new(0,0,0))
-grid.BackgroundTransparency = 1
-grid.AutomaticSize = Enum.AutomaticSize.Y
-grid.LayoutOrder = itemOrder
-
-local gridLayout = Instance.new("UIGridLayout")
-gridLayout.CellSize = UDim2.new(0.5,-4,0,28)
-gridLayout.CellPadding = UDim2.new(0,4,0,4)
-gridLayout.SortOrder = Enum.SortOrder.LayoutOrder
-gridLayout.Parent = grid
-
-for i, itemName in ipairs(ALL_ITEMS) do
-    local isSelected = IsItemSelected(itemName)
-    local ibtn = Instance.new("TextButton")
-    ibtn.Text = itemName
-    ibtn.Size = UDim2.new(1,0,0,28)
-    ibtn.BackgroundColor3 = isSelected and CLR.ITEMSEL or CLR.ITEMDEF
-    ibtn.TextColor3 = isSelected and CLR.GREEN or CLR.SUB
-    ibtn.TextSize = 11
-    ibtn.Font = Enum.Font.GothamMedium
-    ibtn.BorderSizePixel = 0
-    ibtn.LayoutOrder = i
-    ibtn.TextTruncate = Enum.TextTruncate.AtEnd
-    ibtn.Parent = grid
-    Rnd(ibtn, 6)
-    Strk(ibtn, CLR.BORDER, 1)
-
-    itemToggleBtns[itemName] = {btn=ibtn, selected=isSelected}
-
-    ibtn.MouseButton1Click:Connect(function()
-        -- toggle selection
-        local found = false
-        for idx, sel in ipairs(Config.SelectedItems) do
-            if sel == itemName then
-                table.remove(Config.SelectedItems, idx)
-                found = true
-                break
-            end
-        end
-        if not found then
-            table.insert(Config.SelectedItems, itemName)
-        end
-        SaveConfig(Config)
-        RefreshItemUI()
+        Config[key] = not Config[key]
+        pill.BackgroundColor3 = Config[key] and C.green or C.soft
+        knob.Position = Config[key] and UDim2.new(0, 25, 0.5, -8) or UDim2.new(0, 3, 0.5, -8)
+        State.LastStatus = title .. (Config[key] and " ON" or " OFF")
+        saveConfig()
     end)
 end
 
--- ============================================================
--- PAGE: CHALLENGE
--- ============================================================
-local pageChall = MakeTab("Chall", "⚔️")
+section(Main, "Core")
+toggleRow(Main, "Anti-AFK", "Basic anti idle pulse.", "AntiAFK")
+toggleRow(Main, "Auto Buy", "Buys by live shop stock.", "AutoBuy")
+toggleRow(Main, "Auto Challenge", "Tests multiple challenge args.", "AutoChallenge")
 
-local challOrder = 0
-local function ChallSection(txt)
-    challOrder = challOrder + 1
-    local l = Lbl(pageChall, txt:upper(), UDim2.new(1,0,0,16), nil, CLR.SUB, 10, Enum.Font.GothamBold)
-    l.LayoutOrder = challOrder
-end
+section(Main, "Stats")
+local StatBox = frame(Main, UDim2.new(1, 0, 0, 84), nil, C.panel) corner(StatBox, 9) border(StatBox)
+local BoughtLabel = label(StatBox, "Bought: 0", UDim2.new(1, -12, 0, 18), UDim2.new(0, 12, 0, 8), C.green, 12)
+local LastBuyLabel = label(StatBox, "Last buy: None", UDim2.new(1, -12, 0, 18), UDim2.new(0, 12, 0, 28), C.sub, 11)
+local ChallengeLabel = label(StatBox, "Challenges: 0", UDim2.new(1, -12, 0, 18), UDim2.new(0, 12, 0, 48), C.gold, 12)
+local LastChallengeLabel = label(StatBox, "Last challenge: Idle", UDim2.new(1, -12, 0, 18), UDim2.new(0, 160, 0, 48), C.sub, 11)
 
-ChallSection("Chọn Difficulty")
+section(Main, "Status")
+local StatusBox = frame(Main, UDim2.new(1, 0, 0, 28), nil, C.panel) corner(StatusBox, 8)
+StatusLabel = label(StatusBox, "Status: Ready", UDim2.new(1, -12, 1, 0), UDim2.new(0, 10, 0, 0), C.sub, 11, Enum.Font.GothamMedium)
 
-challOrder = challOrder + 1
-local diffHint = Lbl(pageChall,
-    "Script sẽ EndChallenge hiện tại rồi StartChallenge với difficulty đã chọn.",
-    UDim2.new(1,0,0,32), nil, CLR.SUB, 11, Enum.Font.Gotham)
-diffHint.LayoutOrder = challOrder
+section(Buy, "Mode")
+local ModeBox = frame(Buy, UDim2.new(1, 0, 0, 72), nil, C.panel) corner(ModeBox, 9) border(ModeBox)
+label(ModeBox, "Buy all stock", UDim2.new(1, -74, 0, 22), UDim2.new(0, 12, 0, 8), C.text, 13, Enum.Font.GothamBold)
+label(ModeBox, "OFF = selected items only. ON = all live shop items.", UDim2.new(1, -74, 0, 26), UDim2.new(0, 12, 0, 30), C.sub, 11, Enum.Font.Gotham)
+local BuyAll = Instance.new("TextButton") BuyAll.Size = UDim2.new(0, 44, 0, 22) BuyAll.Position = UDim2.new(1, -56, 0.5, -11) BuyAll.BorderSizePixel = 0 BuyAll.Text = "" BuyAll.BackgroundColor3 = Config.BuyAllItems and C.green or C.soft BuyAll.Parent = ModeBox corner(BuyAll, 11)
+local BuyAllKnob = frame(BuyAll, UDim2.new(0, 16, 0, 16), Config.BuyAllItems and UDim2.new(0, 25, 0.5, -8) or UDim2.new(0, 3, 0.5, -8), Color3.fromRGB(236, 238, 245)) corner(BuyAllKnob, 8)
+BuyAll.MouseButton1Click:Connect(function()
+    Config.BuyAllItems = not Config.BuyAllItems
+    BuyAll.BackgroundColor3 = Config.BuyAllItems and C.green or C.soft
+    BuyAllKnob.Position = Config.BuyAllItems and UDim2.new(0, 25, 0.5, -8) or UDim2.new(0, 3, 0.5, -8)
+    State.LastStatus = Config.BuyAllItems and "Buy all ON" or "Buy selected only"
+    saveConfig()
+end)
 
-local DIFFICULTIES = {"Easy","Medium","Pro"}
-local diffBtns = {}
+section(Buy, "Shop")
+local BuyBtns = frame(Buy, UDim2.new(1, 0, 0, 30), nil, Color3.new()) BuyBtns.BackgroundTransparency = 1
+local BuyBtnsL = Instance.new("UIListLayout") BuyBtnsL.FillDirection = Enum.FillDirection.Horizontal BuyBtnsL.Padding = UDim.new(0, 6) BuyBtnsL.Parent = BuyBtns
+local ShopInfo = label(Buy, "Load shop to build item list.", UDim2.new(1, 0, 0, 18), nil, C.sub, 11)
+local Grid = frame(Buy, UDim2.new(1, 0, 0, 0), nil, Color3.new()) Grid.BackgroundTransparency = 1 Grid.AutomaticSize = Enum.AutomaticSize.Y
+local GL = Instance.new("UIGridLayout") GL.CellSize = UDim2.new(0.5, -4, 0, 32) GL.CellPadding = UDim2.new(0, 4, 0, 4) GL.Parent = Grid
 
-challOrder = challOrder + 1
-local diffRow = Frm(pageChall, UDim2.new(1,0,0,36), nil, Color3.new(0,0,0))
-diffRow.BackgroundTransparency = 1
-diffRow.LayoutOrder = challOrder
-local diffLayout = Instance.new("UIListLayout")
-diffLayout.FillDirection = Enum.FillDirection.Horizontal
-diffLayout.Padding = UDim.new(0,6)
-diffLayout.Parent = diffRow
-
-local DIFF_COLORS = {Easy=CLR.GREEN, Medium=CLR.YELLOW, Pro=CLR.RED}
-
-local function RefreshDiffUI()
-    for _, diff in ipairs(DIFFICULTIES) do
-        local col = Config.ChallengeDifficulty == diff and DIFF_COLORS[diff] or CLR.TOGOFF
-        local tcol = Config.ChallengeDifficulty == diff and CLR.TEXT or CLR.SUB
-        if diffBtns[diff] then
-            TweenService:Create(diffBtns[diff],TweenInfo.new(0.15),{BackgroundColor3=col,TextColor3=tcol}):Play()
-        end
+local function rebuildShop()
+    for _, child in ipairs(Grid:GetChildren()) do
+        if child:IsA("TextButton") or child:IsA("Frame") then child:Destroy() end
+    end
+    local items = sortedShop()
+    ShopInfo.Text = (#items == 0) and "No shop data yet." or ("Live items: " .. #items)
+    for _, entry in ipairs(items) do
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(1, 0, 0, 32)
+        b.BorderSizePixel = 0
+        b.Text = entry.name .. " [" .. entry.qty .. "]"
+        b.TextSize = 11
+        b.Font = Enum.Font.GothamMedium
+        b.BackgroundColor3 = isSelected(entry.name) and C.active or C.soft
+        b.TextColor3 = isSelected(entry.name) and C.green or C.sub
+        b.Parent = Grid
+        corner(b, 6)
+        border(b)
+        b.MouseButton1Click:Connect(function()
+            toggleItem(entry.name)
+            rebuildShop()
+            State.LastStatus = "Toggled " .. entry.name
+        end)
     end
 end
 
-for _, diff in ipairs(DIFFICULTIES) do
-    local isActive = Config.ChallengeDifficulty == diff
-    local db = Btn(diffRow, diff,
-        UDim2.new(0,88,1,0), nil,
-        isActive and DIFF_COLORS[diff] or CLR.TOGOFF,
-        function()
-            Config.ChallengeDifficulty = diff
-            SaveConfig(Config)
-            RefreshDiffUI()
-            SetStatus("Difficulty: " .. diff, DIFF_COLORS[diff])
-        end
-    )
-    db.TextColor3 = isActive and CLR.TEXT or CLR.SUB
-    diffBtns[diff] = db
+button(BuyBtns, "Refresh Shop", UDim2.new(0.5, -3, 1, 0), nil, C.accent, function() fetchShop() rebuildShop() State.LastStatus = "Shop refreshed" end)
+button(BuyBtns, "Buy Once", UDim2.new(0.5, -3, 1, 0), UDim2.new(0.5, 3, 0, 0), C.green, function() autoBuyOnce() fetchShop() rebuildShop() State.LastStatus = "Manual buy done" end)
+
+section(Chall, "Difficulty")
+local DiffRow = frame(Chall, UDim2.new(1, 0, 0, 30), nil, Color3.new()) DiffRow.BackgroundTransparency = 1
+local DL = Instance.new("UIListLayout") DL.FillDirection = Enum.FillDirection.Horizontal DL.Padding = UDim.new(0, 6) DL.Parent = DiffRow
+local DiffButtons = {}
+local DiffColors = {Easy = C.green, Medium = C.gold, Pro = C.red}
+local function refreshDiff()
+    for name, btn in pairs(DiffButtons) do
+        btn.BackgroundColor3 = Config.ChallengeDifficulty == name and DiffColors[name] or C.soft
+        btn.TextColor3 = Config.ChallengeDifficulty == name and C.text or C.sub
+    end
 end
-RefreshDiffUI()
+for _, diff in ipairs({"Easy", "Medium", "Pro"}) do
+    DiffButtons[diff] = button(DiffRow, diff, UDim2.new(0, 94, 1, 0), nil, C.soft, function()
+        Config.ChallengeDifficulty = diff
+        saveConfig()
+        refreshDiff()
+        State.LastStatus = "Difficulty " .. diff
+    end)
+end
+refreshDiff()
 
-ChallSection("Manual Control")
+section(Chall, "Manual")
+local CBtns = frame(Chall, UDim2.new(1, 0, 0, 30), nil, Color3.new()) CBtns.BackgroundTransparency = 1
+local CBL = Instance.new("UIListLayout") CBL.FillDirection = Enum.FillDirection.Horizontal CBL.Padding = UDim.new(0, 6) CBL.Parent = CBtns
+button(CBtns, "Start Now", UDim2.new(0.5, -3, 1, 0), nil, C.green, function() autoChallengeOnce() end)
+button(CBtns, "End Now", UDim2.new(0.5, -3, 1, 0), UDim2.new(0.5, 3, 0, 0), C.red, function() if RF_EndChallenge then pcall(function() RF_EndChallenge:InvokeServer() end) end State.ChallengeActive = false State.LastChallenge = "Ended manually" end)
+local ChallState = frame(Chall, UDim2.new(1, 0, 0, 28), nil, C.panel) corner(ChallState, 8)
+local ChallStateLabel = label(ChallState, "Challenge idle", UDim2.new(1, -12, 1, 0), UDim2.new(0, 10, 0, 0), C.sub, 11, Enum.Font.GothamMedium)
 
-challOrder = challOrder + 1
-local challBtnRow = Frm(pageChall, UDim2.new(1,0,0,34), nil, Color3.new(0,0,0))
-challBtnRow.BackgroundTransparency = 1
-challBtnRow.LayoutOrder = challOrder
-local cbl = Instance.new("UIListLayout")
-cbl.FillDirection = Enum.FillDirection.Horizontal
-cbl.Padding = UDim.new(0,6)
-cbl.Parent = challBtnRow
+section(Debug, "Runtime")
+local DBox = frame(Debug, UDim2.new(1, 0, 0, 126), nil, C.panel) corner(DBox, 9) border(DBox)
+local FileLabel = label(DBox, "", UDim2.new(1, -12, 0, 18), UDim2.new(0, 12, 0, 8), C.sub, 11)
+local SaveLabel = label(DBox, "", UDim2.new(1, -12, 0, 18), UDim2.new(0, 12, 0, 30), C.sub, 11)
+local ErrorLabel = label(DBox, "", UDim2.new(1, -12, 0, 36), UDim2.new(0, 12, 0, 52), C.sub, 11)
+local RemoteLabel = label(DBox, "", UDim2.new(1, -12, 0, 36), UDim2.new(0, 12, 0, 86), C.sub, 11)
 
-Btn(challBtnRow, "▶ Start Now", UDim2.new(0.5,-3,1,0), nil, CLR.GREEN, function()
-    challengeActive = false
-    TryStartChallenge()
-    SetStatus("Đã thử start challenge!", CLR.GREEN)
+section(Debug, "Actions")
+local DBA = frame(Debug, UDim2.new(1, 0, 0, 30), nil, Color3.new()) DBA.BackgroundTransparency = 1
+local DBL = Instance.new("UIListLayout") DBL.FillDirection = Enum.FillDirection.Horizontal DBL.Padding = UDim.new(0, 6) DBL.Parent = DBA
+button(DBA, "Save Config", UDim2.new(0.5, -3, 1, 0), nil, C.accent, saveConfig)
+button(DBA, "Print Remotes", UDim2.new(0.5, -3, 1, 0), UDim2.new(0.5, 3, 0, 0), C.gold, function()
+    log("=== Functions ===")
+    for _, c in ipairs(Functions:GetChildren()) do log(c.ClassName .. " | " .. c.Name) end
+    log("=== Remotes ===")
+    for _, c in ipairs(Remotes:GetChildren()) do log(c.ClassName .. " | " .. c.Name) end
 end)
-Btn(challBtnRow, "⏹ End", UDim2.new(0.5,-3,1,0), UDim2.new(0.5,3,0,0), CLR.RED, function()
-    pcall(function() RF_EndChallenge:InvokeServer() end)
-    challengeActive = false
-    SetStatus("Đã end challenge", CLR.RED)
-end)
 
-ChallSection("Status")
-challOrder = challOrder + 1
-local challStatusBar = Frm(pageChall, UDim2.new(1,0,0,28), nil, Color3.fromRGB(16,16,26))
-challStatusBar.LayoutOrder = challOrder
-Rnd(challStatusBar,8)
-local challLbl = Lbl(challStatusBar, "● Chưa chạy", UDim2.new(1,-12,1,0), UDim2.new(0,10,0,0), CLR.SUB, 11, Enum.Font.GothamMedium)
+section(Debug, "Recent Logs")
+local LogBox = frame(Debug, UDim2.new(1, 0, 0, 170), nil, C.panel) corner(LogBox, 9) border(LogBox)
+local LogLabel = label(LogBox, "No logs yet", UDim2.new(1, -12, 1, -12), UDim2.new(0, 10, 0, 6), C.sub, 11, Enum.Font.Code)
+LogLabel.TextYAlignment = Enum.TextYAlignment.Top
+
+task.spawn(function() fetchShop() rebuildShop() end)
 
 task.spawn(function()
-    while true do task.wait(1) pcall(function()
-        challLbl.Text = "● " .. (challengeActive and "Challenge đang chạy..." or "Không có challenge")
-        challLbl.TextColor3 = challengeActive and CLR.GREEN or CLR.SUB
-    end) end
-end)
-
--- ============================================================
--- DRAG
--- ============================================================
-local dragging, dragStart, frameStart = false, nil, nil
-Hdr.InputBegan:Connect(function(inp)
-    if inp.UserInputType==Enum.UserInputType.MouseButton1 or inp.UserInputType==Enum.UserInputType.Touch then
-        dragging=true dragStart=inp.Position frameStart=Win.Position
+    while true do
+        task.wait(0.5)
+        BoughtLabel.Text = "Bought: " .. State.Bought
+        LastBuyLabel.Text = "Last buy: " .. State.LastBuy
+        ChallengeLabel.Text = "Challenges: " .. State.Challenges
+        LastChallengeLabel.Text = "Last challenge: " .. State.LastChallenge
+        StatusLabel.Text = "Status: " .. State.LastStatus
+        ChallStateLabel.Text = State.ChallengeActive and "Challenge active" or "Challenge idle"
+        ChallStateLabel.TextColor3 = State.ChallengeActive and C.green or C.sub
+        FileLabel.Text = "File API: " .. tostring(CAN_FILE)
+        SaveLabel.Text = "Config: " .. State.LastSave
+        ErrorLabel.Text = "Last error: " .. State.LastError
+        RemoteLabel.Text = "UpdateShop=" .. tostring(RF_UpdateShop ~= nil) .. " | BuyDefense=" .. tostring(RF_BuyDefense ~= nil) .. " | StartChallenge=" .. tostring(RF_StartChallenge ~= nil) .. " | EndChallenge=" .. tostring(RF_EndChallenge ~= nil)
+        LogLabel.Text = table.concat(State.Logs, "\n")
     end
 end)
-UserInputService.InputChanged:Connect(function(inp)
-    if not dragging then return end
-    if inp.UserInputType==Enum.UserInputType.MouseMovement or inp.UserInputType==Enum.UserInputType.Touch then
-        local d=inp.Position-dragStart
-        Win.Position=UDim2.new(frameStart.X.Scale,frameStart.X.Offset+d.X,frameStart.Y.Scale,frameStart.Y.Offset+d.Y)
+
+local dragging, dragStart, startPos = false, nil, nil
+Head.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = i.Position
+        startPos = Win.Position
     end
 end)
-UserInputService.InputEnded:Connect(function(inp)
-    if inp.UserInputType==Enum.UserInputType.MouseButton1 or inp.UserInputType==Enum.UserInputType.Touch then dragging=false end
+UIS.InputChanged:Connect(function(i)
+    if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+        local d = i.Position - dragStart
+        Win.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+    end
+end)
+UIS.InputEnded:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
+end)
+UIS.InputBegan:Connect(function(i, gp)
+    if not gp and i.KeyCode == Enum.KeyCode.RightShift then Win.Visible = not Win.Visible end
 end)
 
--- ============================================================
--- KEYBIND
--- ============================================================
-UserInputService.InputBegan:Connect(function(inp,gp)
-    if gp then return end
-    if inp.KeyCode==Enum.KeyCode.RightShift then Win.Visible=not Win.Visible end
-end)
-
--- ============================================================
--- INIT
--- ============================================================
-SetStatus("Script loaded ✅", CLR.GREEN)
-task.delay(3, function() SetStatus("Ready") end)
-print("[DYC] ✅ v2.0 loaded! Tabs: Main | Buy | Chall")
+log("UI ready")
+log("Shop list is dynamic in v3.0")
