@@ -77,6 +77,8 @@ local State = {
     ChallengeActive = false,  -- đang trong 1 challenge
     ChallRunning    = false,  -- queue đang chạy
     ChallCurrent    = "—",
+    ChallengeStatus = {},
+    ChallengeRetryAt= {},
     ShopItems       = {},
     Logs            = {},
 }
@@ -174,6 +176,39 @@ local function GetCooldownSeconds()
     return 0
 end
 
+local function GetChallengeRetryRemaining(def)
+    local retryAt = State.ChallengeRetryAt[def.key]
+    if not retryAt then return 0 end
+    return math.max(0, math.ceil(retryAt - os.clock()))
+end
+
+local function SetChallengeCooldown(def, seconds)
+    local retryFor = math.max(5, tonumber(seconds) or 0)
+    State.ChallengeRetryAt[def.key] = os.clock() + retryFor
+    State.ChallengeStatus[def.key] = string.format("cooldown %ds", retryFor)
+end
+
+local function SetChallengeQueued(def)
+    State.ChallengeRetryAt[def.key] = nil
+    State.ChallengeStatus[def.key] = Config[def.key] and "queued" or "off"
+end
+
+local function ResetChallengeStatuses()
+    for _, def in ipairs(CHALLDEFS) do
+        SetChallengeQueued(def)
+    end
+end
+
+local function BuildChallengeQueue()
+    local queue = {}
+    for _, def in ipairs(CHALLDEFS) do
+        if Config[def.key] then
+            table.insert(queue, def)
+        end
+    end
+    return queue
+end
+
 -- Check đang trong raid: Raid.Top.Buttons.Stop button visible = "End"
 local function IsInRaid()
     local fw = GetFramework()
@@ -212,6 +247,11 @@ end
 if RE_ChallengeEnd then
     RE_ChallengeEnd.OnClientEvent:Connect(function()
         State.ChallengeActive = false
+        for _, def in ipairs(CHALLDEFS) do
+            if State.ChallengeStatus[def.key] == "running" then
+                State.ChallengeStatus[def.key] = "queued"
+            end
+        end
         log("◀ ChallengeEnd event received")
     end)
 end
@@ -249,68 +289,55 @@ local function RunOneChallenge(def)
     State.ChallCurrent = def.label
     log("⚔️ Trying challenge: "..def.label.." (diff="..def.diff..")")
 
-    -- Step 1: Đợi nếu còn cooldown
-    local cooldown = GetCooldownSeconds()
-    if cooldown > 0 then
-        log(string.format("⏳ Cooldown: %ds, waiting...", cooldown))
-        State.ChallCurrent = def.label.." ⏳"..cooldown.."s"
-        task.wait(cooldown + 3)
+    local retryRemaining = GetChallengeRetryRemaining(def)
+    if retryRemaining > 0 then
+        State.ChallCurrent = string.format("%s ⏳%ds", def.label, retryRemaining)
+        return "cooldown"
     end
 
-    -- Step 2: End raid nếu đang trong raid
+    -- Step 1: End raid nếu đang trong raid
     if IsInRaid() then
+        State.ChallCurrent = "Ending raid -> "..def.label
         DoEndRaid()
         task.wait(1)
     end
 
-    -- Step 3: EndChallenge để clear state cũ
+    -- Step 2: EndChallenge để clear state cũ
     pcall(function() RF_EndChallenge:InvokeServer() end)
     task.wait(0.5)
 
-    -- Step 4: StartChallenge với đúng difficulty string
-    -- Confirmed: StartChallenge("Easy"/"Medium"/"Hard"/"Insane"/"Godly")
-    local started = false
-    for attempt = 1, 6 do
-        local ok, result = pcall(function()
-            return RF_StartChallenge:InvokeServer(def.diff)
-        end)
-        log(string.format("  StartChallenge(%s) attempt %d -> ok=%s result=%s",
-            def.diff, attempt, tostring(ok), tostring(result)))
+    -- Step 3: Try start đúng difficulty string
+    local ok, result = pcall(function()
+        return RF_StartChallenge:InvokeServer(def.diff)
+    end)
+    log(string.format("  StartChallenge(%s) -> ok=%s result=%s",
+        def.diff, tostring(ok), tostring(result)))
 
-        if ok and result ~= false then
-            started = true
-            break
-        end
-
-        -- result=false = còn cooldown hoặc state issue
-        if attempt == 1 then
-            -- Thử lại sau khi đợi thêm
-            local cd = GetCooldownSeconds()
-            if cd > 0 then
-                log("⏳ Still cooldown: "..cd.."s")
-                State.ChallCurrent = def.label.." ⏳"..cd.."s"
-                task.wait(cd + 3)
-            else
-                task.wait(2)
-            end
-        else
-            task.wait(2)
-        end
-    end
-
-    if not started then
-        log("❌ "..def.label.." could not start, skip")
+    if not ok then
+        State.LastError = "StartChallenge "..def.diff..": "..tostring(result)
+        State.ChallengeStatus[def.key] = "start failed"
+        task.wait(1)
         return "failed"
     end
 
-    -- Step 5: Đợi challenge kết thúc
+    if result == false then
+        local cooldown = GetCooldownSeconds()
+        SetChallengeCooldown(def, cooldown > 0 and cooldown or 10)
+        State.ChallCurrent = string.format("%s ⏳%ds", def.label, GetChallengeRetryRemaining(def))
+        log("⏳ "..def.label.." still on cooldown, skipping for now")
+        return "cooldown"
+    end
+
+    -- Step 4: Đợi challenge kết thúc
     State.ChallengeActive = true
+    State.ChallengeRetryAt[def.key] = nil
+    State.ChallengeStatus[def.key] = "running"
     State.ChallCurrent = "⚔️ "..def.label.." running..."
     log("✅ "..def.label.." started! Waiting for end...")
 
     local timeout = def.waves * 10 + 90
     local elapsed = 0
-    while State.ChallengeActive and elapsed < timeout do
+    while Config.AutoChallenge and State.ChallengeActive and elapsed < timeout do
         task.wait(1)
         elapsed = elapsed + 1
         -- Update label với elapsed time
@@ -319,7 +346,16 @@ local function RunOneChallenge(def)
         end
     end
 
+    if elapsed >= timeout then
+        State.ChallengeActive = false
+        State.ChallengeStatus[def.key] = "timeout"
+        State.LastError = def.label.." timeout"
+        log("⚠️ "..def.label.." timed out, forcing next sweep")
+        return "failed"
+    end
+
     State.ChallengeActive = false
+    State.ChallengeStatus[def.key] = "queued"
     State.Challenges = State.Challenges + 1
     log(string.format("✅ %s done in %ds! Total: %d", def.label, elapsed, State.Challenges))
     return "done"
@@ -332,50 +368,59 @@ local challLoopRunning = false
 local function ChallengeLoop()
     if challLoopRunning then return end
     challLoopRunning = true
+    ResetChallengeStatuses()
     log("=== Challenge loop started ===")
 
     while Config.AutoChallenge do
-        -- Build queue từ config theo thứ tự
-        local queue = {}
-        for _, def in ipairs(CHALLDEFS) do
-            if Config[def.key] then
-                table.insert(queue, def)
-            end
-        end
+        local queue = BuildChallengeQueue()
 
         if #queue == 0 then
             State.ChallCurrent = "No difficulty selected"
             task.wait(3)
-            -- eslint
         else
-            local anyDone = false
-
-            -- Chạy từng challenge trong queue
+            local anyReady = false
+            local nextRetry = math.huge
             for _, def in ipairs(queue) do
-                if not Config.AutoChallenge then break end
-                local result = RunOneChallenge(def)
-                if result == "done" then
-                    anyDone = true
+                local remaining = GetChallengeRetryRemaining(def)
+                if remaining <= 0 then
+                    anyReady = true
+                else
+                    nextRetry = math.min(nextRetry, remaining)
                 end
-                task.wait(2)
             end
 
-            -- Sau khi xong tất cả -> check cooldown tổng
-            if Config.AutoChallenge then
-                local cd = GetCooldownSeconds()
-                if cd > 0 then
-                    -- Còn cooldown -> restart raid trong lúc chờ
-                    log("All challenges done. Cooldown: "..cd.."s -> Restarting raid...")
-                    State.ChallCurrent = "⏳ All done, restarting raid"
+            if not anyReady then
+                local waitFor = nextRetry ~= math.huge and math.max(3, nextRetry) or 5
+                State.ChallCurrent = string.format("No challenge ready (%ds)", waitFor)
+                if not IsInRaid() then
                     DoStartRaid()
-                    -- Đợi cooldown hết rồi vòng lặp tiếp theo sẽ tự xử lý
-                    task.wait(cd + 3)
-                else
-                    -- Không còn cooldown -> restart raid và chạy lại ngay
-                    log("All done, restarting raid...")
-                    State.ChallCurrent = "✅ Queue done"
+                end
+                task.wait(math.min(waitFor, 30))
+            else
+                local anyDone = false
+
+                if IsInRaid() then
+                    State.ChallCurrent = "Ending raid for challenges"
+                    DoEndRaid()
+                    task.wait(1)
+                end
+
+                for _, def in ipairs(queue) do
+                    if not Config.AutoChallenge then break end
+                    local result = RunOneChallenge(def)
+                    if result == "done" then
+                        anyDone = true
+                    end
+                    task.wait(1)
+                end
+
+                if Config.AutoChallenge and not IsInRaid() then
+                    State.ChallCurrent = anyDone and "Queue sweep done" or "No challenge started"
                     DoStartRaid()
-                    task.wait(5)
+                end
+
+                if Config.AutoChallenge then
+                    task.wait(anyDone and 3 or 5)
                 end
             end
         end
@@ -385,6 +430,7 @@ local function ChallengeLoop()
     log("=== Challenge loop stopped, restarting raid ===")
     DoStartRaid()
     State.ChallCurrent = "—"
+    ResetChallengeStatuses()
     challLoopRunning = false
 end
 
@@ -567,10 +613,12 @@ togRow(Main,"Auto Challenge",
     "AutoChallenge",
     function(on)
         if on then
+            ResetChallengeStatuses()
             if not challLoopRunning then
                 task.spawn(ChallengeLoop)
             end
         else
+            ResetChallengeStatuses()
             log("AutoChallenge OFF")
         end
     end
@@ -660,6 +708,7 @@ for _, def in ipairs(CHALLDEFS) do
         Config[def.key]=not Config[def.key]
         TweenSvc:Create(pill,TweenInfo.new(0.15),{BackgroundColor3=Config[def.key] and C.green or C.soft}):Play()
         TweenSvc:Create(knob,TweenInfo.new(0.15),{Position=Config[def.key] and UDim2.new(0,25,0.5,-8) or UDim2.new(0,3,0.5,-8)}):Play()
+        SetChallengeQueued(def)
         saveConfig()
         -- Nếu AutoChallenge đang ON và loop chưa chạy -> kick off
         if Config.AutoChallenge and not challLoopRunning then
@@ -737,16 +786,21 @@ task.spawn(function()
             L_QueueCurrent.Text = "Current: "..State.ChallCurrent
 
             -- Per-challenge badge
-            local cd = GetCooldownSeconds()
             for _, def in ipairs(CHALLDEFS) do
                 local ud = challUIData[def.key]
                 if ud then
-                    if State.ChallCurrent:find(def.label) and challLoopRunning then
+                    local status = State.ChallengeStatus[def.key]
+                    local retryRemaining = GetChallengeRetryRemaining(def)
+
+                    if status == "running" then
                         ud.badge.Text = "⚔️ running"
                         ud.badge.TextColor3 = C.green
-                    elseif cd > 0 then
-                        ud.badge.Text = string.format("⏳%ds", cd)
+                    elseif retryRemaining > 0 then
+                        ud.badge.Text = string.format("⏳%ds", retryRemaining)
                         ud.badge.TextColor3 = C.gold
+                    elseif status == "timeout" or status == "start failed" then
+                        ud.badge.Text = "⚠ "..status
+                        ud.badge.TextColor3 = C.red
                     else
                         ud.badge.Text = Config[def.key] and "✅ queued" or "—"
                         ud.badge.TextColor3 = Config[def.key] and C.green or C.sub
